@@ -1,4 +1,4 @@
-// Khmer Dubber – Edge voice for Deno Deploy (free). Paste this whole file into a Deno Deploy playground.
+// Khmer Dubber – Edge voice for Deno Deploy (free). Hardened version: text cleaning, retries, max 2 live requests.
 // Endpoints:  GET /ping  |  GET /test (plays a Khmer sample or shows the error)  |  POST /tts {text, voice, rate}
 
 const TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
@@ -9,6 +9,16 @@ const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods
 const reply = (code, body, type = "text/plain; charset=utf-8") => new Response(body, { status: code, headers: { ...CORS, "Content-Type": type } });
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
 const rid = () => hex(crypto.getRandomValues(new Uint8Array(16)));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// remove characters the Khmer voice cannot read, fix the Chinese full stop
+const clean = (t) => t.replace(/[。｡]/g, "។").replace(/[\u2E80-\u9FFF\uAC00-\uD7AF\uFF00-\uFFEF]/g, "").replace(/[\u0000-\u001F\u007F\u200B-\u200D\uFEFF]/g, " ").replace(/\s+/g, " ").trim();
+const speakable = (t) => /[\u1780-\u17B3\u17E0-\u17E90-9A-Za-z]/.test(t);
+
+// at most 2 live syntheses at once (Microsoft throttles bursts)
+let live = 0; const waiters = [];
+const acquire = async () => { if (live >= 2) await new Promise((r) => waiters.push(r)); live++; };
+const release = () => { live--; const w = waiters.shift(); if (w) w(); };
 
 async function gec() {
   let t = Math.floor(Date.now() / 1000) + 11644473600;
@@ -72,25 +82,34 @@ async function synth(text, voice, rate) {
   return out;
 }
 
+async function synthRetry(text, voice, rate, tries = 3) {
+  let last = "unknown error";
+  for (let k = 0; k < tries; k++) {
+    await acquire();
+    try { const a = await synth(text, voice, rate); if (a.length > 200) return a; last = "Edge returned no audio"; }
+    catch (e) { last = String(e.message || e); }
+    finally { release(); }
+    await sleep(800 * (k + 1));
+  }
+  throw new Error(last);
+}
+
 Deno.serve(async (request) => {
   const { pathname } = new URL(request.url);
   if (request.method === "OPTIONS") return reply(204, null);
   if (request.method === "GET" && pathname.startsWith("/ping")) return reply(200, JSON.stringify({ ok: true, voices: VOICES }), "application/json");
   if (request.method === "GET" && pathname.startsWith("/test")) {
-    try {
-      const a = await synth("សួស្តី នេះគឺជាការសាកល្បងសំឡេង", VOICES[1], "+0%");
-      return a.length ? reply(200, a, "audio/mpeg") : reply(502, "Edge connected but returned no audio");
-    } catch (e) { return reply(500, "TEST FAILED: " + (e.message || e)); }
+    try { return reply(200, await synthRetry("សួស្តី នេះគឺជាការសាកល្បងសំឡេង", VOICES[1], "+0%"), "audio/mpeg"); }
+    catch (e) { return reply(500, "TEST FAILED: " + (e.message || e)); }
   }
   if (request.method === "POST" && pathname.startsWith("/tts")) {
     try {
       const d = await request.json();
-      const text = String(d.text || "").trim().slice(0, 1500), voice = String(d.voice || VOICES[0]), rate = String(d.rate || "+0%");
-      if (!text) return reply(400, "empty text");
+      const text = clean(String(d.text || "")).slice(0, 1500), voice = String(d.voice || VOICES[0]), rate = String(d.rate || "+0%");
+      if (!speakable(text)) return reply(400, "no speakable text");
       if (!VOICES.includes(voice)) return reply(400, "unsupported voice");
       if (!/^[+-]\d{1,3}%$/.test(rate)) return reply(400, "bad rate");
-      const a = await synth(text, voice, rate);
-      return a.length ? reply(200, a, "audio/mpeg") : reply(502, "Edge returned no audio");
+      return reply(200, await synthRetry(text, voice, rate), "audio/mpeg");
     } catch (e) { return reply(500, String(e.message || e).slice(0, 300)); }
   }
   return reply(200, "Khmer Edge voice helper is running. Use /ping or /test.");
